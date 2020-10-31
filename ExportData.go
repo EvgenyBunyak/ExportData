@@ -8,14 +8,17 @@ import (
     "database/sql"
     _ "github.com/godror/godror"
     "strconv"
+    "strings"
     "sync"
 )
 
 type Params struct {
-    ConnStr         string
-    FileName        string
-    Query           string
-    MaxSizeMB       int
+    ConnStr             string
+    FileName        	string
+    Query           	string
+    MaxSizeMB       	int
+    DoubleQuotes 		bool
+    TabSeparated 		bool
 }
 
 type Range struct {
@@ -34,6 +37,9 @@ func main() {
     rangeEnd := flag.String("rangeEnd", "-", "range end value")
     batchSize := flag.Int("batch", 10000, "batch size (row count)")
 
+    doubleQuotes := flag.Bool("doubleQuotes", true, "Double quotes")
+    tabSeparated := flag.Bool("tabSeparated", false, "Tab-separated values")
+
     flag.Parse()
 
     // Read query file
@@ -44,7 +50,8 @@ func main() {
     }
 
     params := Params{ConnStr: *connStr, FileName: *fileName,
-                        Query: string(content), MaxSizeMB: *maxSizeMB}
+                        Query: string(content), MaxSizeMB: *maxSizeMB,
+                    	DoubleQuotes: *doubleQuotes, TabSeparated: *tabSeparated}
 
     if params.FileName == "-" {
         params.FileName = *queryFileName
@@ -136,7 +143,7 @@ func unloadTable(params Params) {
 
     // Write to file
     go func(params Params, ciRows <- chan []interface{}) {
-        writeToFile(0, params.FileName, params.MaxSizeMB, ciRows)
+        writeToFile(0, params, params.MaxSizeMB, ciRows)
         w.Done()
     }(params, cRows)
 
@@ -214,7 +221,7 @@ func unloadTableByRange(rId int, params Params, ciRange <- chan Range, coError c
 
     // Write to file
     go func(rId int, params Params, ciRows <- chan []interface{}) {
-        writeToFile(rId, params.FileName, params.MaxSizeMB, ciRows)
+        writeToFile(rId, params, params.MaxSizeMB, ciRows)
         w.Done()
     }(rId, params, cRows)
 
@@ -293,15 +300,15 @@ func fetchRows(rows *sql.Rows, scannedRow []interface{}, row []interface{}, coRo
     }
 }
 
-func newFile(fileName string, rId int, counter int) (*os.File, int) {
+func newFile(fileName string, format string, rId int, counter int) (*os.File, int) {
     c := counter;
     c++;
 
     fn := fileName;
     if rId == 0 {
-        fn += fmt.Sprintf("_%07d.tsv", c);
+        fn += fmt.Sprintf("_%07d." + format, c);
     } else {
-        fn += fmt.Sprintf("_%d_%07d.tsv", rId, c)
+        fn += fmt.Sprintf("_%d_%07d." + format, rId, c)
     }
 
     f, err := os.Create(fn)
@@ -320,13 +327,21 @@ func getSizeMB(f *os.File) float64 {
     return float64(fi.Size()) / 1024 / 1024
 }
 
-func writeToFile(rId int, fileName string, maxSizeMB int, ciRows <- chan []interface{}) {
-    counter := 0;
+func writeToFile(rId int, params Params, maxSizeMB int, ciRows <- chan []interface{}) {
+	counter := 0;
 
-    f, counter := newFile(fileName, rId, counter)
+	sep := ",";
+    format := "csv";
+    if params.TabSeparated {
+    	sep = "\t"
+    	format = "tsv"
+    }
+
+    f, counter := newFile(params.FileName, format, rId, counter)
 
     i := 0;
     for row := range ciRows {
+    	// Check file size
         i++;
         if i >= 1000 {
             i = 0;
@@ -335,16 +350,23 @@ func writeToFile(rId int, fileName string, maxSizeMB int, ciRows <- chan []inter
                 if err != nil {
                     fmt.Println("writeToFile", err)
                 }
-                f, counter = newFile(fileName, rId, counter)
+                f, counter = newFile(params.FileName, format, rId, counter)
             }
         }
 
-        for i, r := range row {
-            if i == 0 {
-                fmt.Fprint(f, fmt.Sprintf("%s", ToString(r)))
-            } else {
-                fmt.Fprint(f, fmt.Sprintf("\t%s", ToString(r)))
+        // Put row to file
+        for i, col := range row {
+        	val := ToString(col);
+
+        	if params.DoubleQuotes && fmt.Sprintf("%T", col) == "sql.NullString" {
+        		val = "\"" + strings.ReplaceAll(val, "\"", "\"\"") + "\""
+        	}
+
+        	if i > 0 {
+        		val = sep + val
             }
+
+            fmt.Fprint(f, val)
         }
         fmt.Fprint(f, fmt.Sprintf("\n"))
     }
