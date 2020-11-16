@@ -1,15 +1,20 @@
 package main
 
 import (
+    "database/sql"
     "flag"
     "fmt"
     "io/ioutil"
     "os"
-    "database/sql"
-    _ "github.com/godror/godror"
+    "regexp"
     "strconv"
     "strings"
     "sync"
+    "syscall"
+    "time"
+
+    "golang.org/x/crypto/ssh/terminal"
+    _ "github.com/godror/godror"
 )
 
 type Params struct {
@@ -38,7 +43,7 @@ func main() {
     batchSize := flag.Int("batch", 10000, "batch size (row count)")
 
     doubleQuotes := flag.Bool("doubleQuotes", true, "Double quotes")
-    tabSeparated := flag.Bool("tabSeparated", false, "Tab-separated values")
+    tabSeparated := flag.Bool("tabSeparated", true, "Tab-separated values")
 
     flag.Parse()
 
@@ -49,14 +54,24 @@ func main() {
         return
     }
 
+    // Init parameters
     params := Params{ConnStr: *connStr, FileName: *fileName,
                         Query: string(content), MaxSizeMB: *maxSizeMB,
                     	DoubleQuotes: *doubleQuotes, TabSeparated: *tabSeparated}
+
+    // Check and read password
+    params.ConnStr, err = readPassword(params.ConnStr)
+
+    if err != nil {
+        fmt.Println(err)
+        return
+    }
 
     if params.FileName == "-" {
         params.FileName = *queryFileName
     }
 
+    // Read range
     if *rangeStart != "-" && *rangeEnd != "-" {
         rs, err := strconv.Atoi(*rangeStart)
         if err != nil {
@@ -76,28 +91,97 @@ func main() {
     }
 }
 
-func nullFloat64ToString(v sql.NullFloat64) string {
-    if v.Valid {
-        return strconv.FormatFloat(v.Float64, 'f', -1, 64)
+func readPassword(connStr string) (string, error) {
+    re, err := regexp.Compile(".+/{1}.+@{1}")
+    if err != nil {
+        return "", err
     }
-    return ""
+
+    if re.MatchString(connStr) {
+        return connStr, nil
+    }
+
+    newConnStr := connStr;
+
+    fmt.Print("Enter password: ")
+    bytePassword, err := terminal.ReadPassword(int(syscall.Stdin))
+    if err != nil {
+        return "", err
+    }
+
+    re, err = regexp.Compile("@")
+    if err != nil {
+        return "", err
+    }
+    newConnStr = re.ReplaceAllString(newConnStr, fmt.Sprintf("/%s@", string(bytePassword)))
+
+    return newConnStr, nil
+}
+
+func nullFloat64ToString(v sql.NullFloat64) string {
+    if !v.Valid {
+        return ""
+    }
+    return strconv.FormatFloat(v.Float64, 'f', -1, 64)
 }
 
 func nullStringToString(v sql.NullString) string {
-    if v.Valid {
-        return v.String
+    if !v.Valid {
+        return ""
+    }
+    return v.String
+}
+
+func nullTimeToString(v sql.NullTime, columnType string) string {
+    if !v.Valid {
+        return ""
+    }
+
+    switch columnType {
+    case "DATE":
+        return v.Time.Format("2006-01-02 15:04:05")
+    case "TIMESTAMP":
+        return v.Time.Format("2006-01-02 15:04:05.999999999")
+    case "TIMESTAMP WITH TIME ZONE":
+        return v.Time.Format("2006-01-02 15:04:05.999999999 -0700")
+    case "TIMESTAMP WITH LOCAL TIME ZONE":
+        return v.Time.Format("2006-01-02 15:04:05.999999999")
     }
     return ""
 }
 
-func ToString(i interface{}) string {
+func toString(i interface{}, columnType string) string {
     switch fmt.Sprintf("%T", i) {
-    case "sql.NullFloat64":
-        return nullFloat64ToString(i.(sql.NullFloat64))
-    case "sql.NullString":
-        return nullStringToString(i.(sql.NullString))
+    case "*sql.NullFloat64":
+        return nullFloat64ToString(*i.(*sql.NullFloat64))
+    case "*sql.NullString":
+        return nullStringToString(*i.(*sql.NullString))
+    case "*sql.NullTime":
+        return nullTimeToString(*i.(*sql.NullTime), columnType)
     }
     return ""
+}
+
+func defineColumnTypes(rows *sql.Rows) (columnTypes []*sql.ColumnType, row []interface{}, err error) {
+    columnTypes, err = rows.ColumnTypes()
+    if err != nil {
+    	return
+    }
+
+    for _, c := range columnTypes {
+        if c.DatabaseTypeName() == "NUMBER" {
+            //row = append(row, &sql.NullFloat64{0, false})
+            row = append(row, &sql.NullString{"", false})
+        } else if c.DatabaseTypeName() == "VARCHAR2" || c.DatabaseTypeName() == "NVARCHAR2" {
+            row = append(row, &sql.NullString{"", false})
+        } else if c.DatabaseTypeName() == "DATE" || c.DatabaseTypeName() == "TIMESTAMP" || c.DatabaseTypeName() == "TIMESTAMP WITH TIME ZONE" || c.DatabaseTypeName() == "TIMESTAMP WITH LOCAL TIME ZONE" {
+            row = append(row, &sql.NullTime {time.Time{}, false})
+        } else {
+        	err = fmt.Errorf("Unexpected type: %s ", c.DatabaseTypeName())
+        }
+    }
+
+    return
 }
 
 func unloadTable(params Params) {
@@ -118,19 +202,12 @@ func unloadTable(params Params) {
         return
     }
 
-    // Set row
-    var scannedRow = []interface{}{}
-    var row = []interface{}{}
-
-    colTypes, err := rows.ColumnTypes()
-    for _, c := range colTypes {
-        if c.DatabaseTypeName() == "NUMBER" {
-            scannedRow = append(scannedRow, &sql.NullFloat64{0, false})
-            row = append(row, sql.NullFloat64{0, false})
-        } else if c.DatabaseTypeName() == "VARCHAR2" {
-            scannedRow = append(scannedRow, &sql.NullString{"", false})
-            row = append(row, sql.NullString{"", false})
-        }
+    // Define column types
+    columnTypes, row, err := defineColumnTypes(rows)
+    if err != nil {
+        fmt.Println("... Error defining column types")
+        fmt.Println(err)
+        return
     }
 
     var w sync.WaitGroup
@@ -138,18 +215,17 @@ func unloadTable(params Params) {
     defer w.Wait()
 
     // Make channel
-    cRows := make(chan []interface{})
+    cRows := make(chan []string)
     defer close(cRows)
 
     // Write to file
-    go func(params Params, ciRows <- chan []interface{}) {
+    go func(params Params, ciRows <- chan []string) {
         writeToFile(0, params, params.MaxSizeMB, ciRows)
         w.Done()
     }(params, cRows)
 
-
     // Fetch rows
-    fetchRows(rows, scannedRow, row, cRows)
+    fetchRows(rows, row, columnTypes, params.DoubleQuotes, cRows)
 
     rows.Close()
 
@@ -191,6 +267,7 @@ func runUnloadTableByRange(params Params, rangeStart int, rangeEnd int, batchSiz
         return
     }
 
+    // Generation of ranges
     for f := rangeStart; f <= rangeEnd; f += batchSize {
         l := f + batchSize - 1;
         if l > rangeEnd {
@@ -209,6 +286,7 @@ func unloadTableByRange(rId int, params Params, ciRange <- chan Range, coError c
     }
     defer db.Close()
 
+    // Error - Ok
     coError <- nil
 
     var w sync.WaitGroup
@@ -216,11 +294,11 @@ func unloadTableByRange(rId int, params Params, ciRange <- chan Range, coError c
     defer w.Wait()
 
     // Make channel
-    cRows := make(chan []interface{})
+    cRows := make(chan []string)
     defer close(cRows)
 
     // Write to file
-    go func(rId int, params Params, ciRows <- chan []interface{}) {
+    go func(rId int, params Params, ciRows <- chan []string) {
         writeToFile(rId, params, params.MaxSizeMB, ciRows)
         w.Done()
     }(rId, params, cRows)
@@ -236,23 +314,15 @@ func unloadTableByRange(rId int, params Params, ciRange <- chan Range, coError c
             return
         }
 
-        // Set row
-        var scannedRow = []interface{}{}
-        var row = []interface{}{}
-
-        colTypes, err := rows.ColumnTypes()
-        for _, c := range colTypes {
-            if c.DatabaseTypeName() == "NUMBER" {
-                scannedRow = append(scannedRow, &sql.NullFloat64{0, false})
-                row = append(row, sql.NullFloat64{0, false})
-            } else if c.DatabaseTypeName() == "VARCHAR2" {
-                scannedRow = append(scannedRow, &sql.NullString{"", false})
-                row = append(row, sql.NullString{"", false})
-            }
-        }
+        // Define column types
+	    columnTypes, row, err := defineColumnTypes(rows)
+	    if err != nil {
+	    	fmt.Println(rId, "... Error defining column types", err)
+	        return
+	    }
 
         // Fetch rows
-        fetchRows(rows, scannedRow, row, cRows)
+        fetchRows(rows, row, columnTypes, params.DoubleQuotes, cRows)
 
         rows.Close()
     }
@@ -275,28 +345,32 @@ func connectToDB(connStr string) (db *sql.DB, err error) {
         return nil, err
     }
 
+    if _, err = db.Exec("alter session set NLS_NUMERIC_CHARACTERS = '. '"); err != nil {
+        return nil, err
+    }
+
     return db, nil
 }
 
-func fetchRows(rows *sql.Rows, scannedRow []interface{}, row []interface{}, coRows chan <- []interface{}) {
+func fetchRows(rows *sql.Rows, row []interface{}, columnTypes []*sql.ColumnType, doubleQuotes bool, coRows chan <- []string) {
     for rows.Next() {
-        if err := rows.Scan(scannedRow...); err != nil {
+        if err := rows.Scan(row...); err != nil {
             fmt.Println(err)
         }
 
-        buffer := make([]interface{}, len(row))
-        copy(buffer, row)
+        strRow := make([]string, len(row))
 
-        for i, r := range scannedRow {
-            switch fmt.Sprintf("%T", r) {
-                case "*sql.NullFloat64":
-                    buffer[i] = *r.(*sql.NullFloat64)
-                case "*sql.NullString":
-                    buffer[i] = *r.(*sql.NullString)
+        // Columns to string array
+        for i, col := range row {
+            typeName := columnTypes[i].DatabaseTypeName();
+            strRow[i] = toString(col, typeName)
+
+            if doubleQuotes && (typeName == "VARCHAR2" || typeName == "NVARCHAR2" || typeName == "DATE" || typeName == "TIMESTAMP" || typeName == "TIMESTAMP WITH TIME ZONE" || typeName == "TIMESTAMP WITH LOCAL TIME ZONE") {
+                strRow[i] = "\"" + strings.ReplaceAll(strRow[i], "\"", "\"\"") + "\""
             }
         }
 
-        coRows <- buffer
+        coRows <- strRow
     }
 }
 
@@ -327,7 +401,7 @@ func getSizeMB(f *os.File) float64 {
     return float64(fi.Size()) / 1024 / 1024
 }
 
-func writeToFile(rId int, params Params, maxSizeMB int, ciRows <- chan []interface{}) {
+func writeToFile(rId int, params Params, maxSizeMB int, ciRows <- chan []string) {
 	counter := 0;
 
 	sep := ",";
@@ -341,7 +415,7 @@ func writeToFile(rId int, params Params, maxSizeMB int, ciRows <- chan []interfa
 
     i := 0;
     for row := range ciRows {
-    	// Check file size
+    	// Check file size one time per N rows
         i++;
         if i >= 1000 {
             i = 0;
@@ -354,21 +428,7 @@ func writeToFile(rId int, params Params, maxSizeMB int, ciRows <- chan []interfa
             }
         }
 
-        // Put row to file
-        for i, col := range row {
-        	val := ToString(col);
-
-        	if params.DoubleQuotes && fmt.Sprintf("%T", col) == "sql.NullString" {
-        		val = "\"" + strings.ReplaceAll(val, "\"", "\"\"") + "\""
-        	}
-
-        	if i > 0 {
-        		val = sep + val
-            }
-
-            fmt.Fprint(f, val)
-        }
-        fmt.Fprint(f, fmt.Sprintf("\n"))
+        fmt.Fprintln(f, strings.Join(row, sep))
     }
 
     // File
