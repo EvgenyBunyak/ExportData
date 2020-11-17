@@ -1,11 +1,14 @@
 package main
 
 import (
+    "bufio"
+    "compress/gzip"
     "database/sql"
     "flag"
     "fmt"
     "io/ioutil"
     "os"
+    "path/filepath"
     "regexp"
     "strconv"
     "strings"
@@ -22,6 +25,7 @@ type Params struct {
     FileName        	string
     Query           	string
     MaxSizeMB       	int
+    Compress            bool
     DoubleQuotes 		bool
     TabSeparated 		bool
 }
@@ -35,7 +39,8 @@ func main() {
     connStr := flag.String("conn", "", "connection string")
     queryFileName := flag.String("query", "", "query file name")
     fileName := flag.String("fname", "-", "file name, without extension")
-    maxSizeMB := flag.Int("maxsize", 10, "file max size (MB)")
+    maxSizeMB := flag.Int("maxsize", 250, "file max size (MB)")
+    compress := flag.Bool("compress", true, "compress to gzip file")
 
     parallel := flag.Int("parallel", 1, "parallel level")
     rangeStart := flag.String("rangeStart", "-", "range start value")
@@ -56,19 +61,20 @@ func main() {
 
     // Init parameters
     params := Params{ConnStr: *connStr, FileName: *fileName,
-                        Query: string(content), MaxSizeMB: *maxSizeMB,
+                        Query: string(content), MaxSizeMB: *maxSizeMB, Compress: *compress,
                     	DoubleQuotes: *doubleQuotes, TabSeparated: *tabSeparated}
 
     // Check and read password
-    params.ConnStr, err = readPassword(params.ConnStr)
+    params.ConnStr, err = ReadPassword(params.ConnStr)
 
     if err != nil {
         fmt.Println(err)
         return
     }
 
+    // Generate file name
     if params.FileName == "-" {
-        params.FileName = *queryFileName
+        params.FileName = TrimExtension(*queryFileName)
     }
 
     // Read range
@@ -84,14 +90,14 @@ func main() {
             return
         }
 
-        runUnloadTableByRange(params, rs, re, *batchSize, *parallel)
+        RunUnloadTableByRange(params, rs, re, *batchSize, *parallel)
 
     } else {
-        unloadTable(params)
+        UnloadTable(params)
     }
 }
 
-func readPassword(connStr string) (string, error) {
+func ReadPassword(connStr string) (string, error) {
     re, err := regexp.Compile(".+/{1}.+@{1}")
     if err != nil {
         return "", err
@@ -109,6 +115,8 @@ func readPassword(connStr string) (string, error) {
         return "", err
     }
 
+    fmt.Println("")
+
     re, err = regexp.Compile("@")
     if err != nil {
         return "", err
@@ -118,21 +126,21 @@ func readPassword(connStr string) (string, error) {
     return newConnStr, nil
 }
 
-func nullFloat64ToString(v sql.NullFloat64) string {
+func NullFloat64ToString(v sql.NullFloat64) string {
     if !v.Valid {
         return ""
     }
     return strconv.FormatFloat(v.Float64, 'f', -1, 64)
 }
 
-func nullStringToString(v sql.NullString) string {
+func NullStringToString(v sql.NullString) string {
     if !v.Valid {
         return ""
     }
     return v.String
 }
 
-func nullTimeToString(v sql.NullTime, columnType string) string {
+func NullTimeToString(v sql.NullTime, columnType string) string {
     if !v.Valid {
         return ""
     }
@@ -150,19 +158,19 @@ func nullTimeToString(v sql.NullTime, columnType string) string {
     return ""
 }
 
-func toString(i interface{}, columnType string) string {
+func ToString(i interface{}, columnType string) string {
     switch fmt.Sprintf("%T", i) {
     case "*sql.NullFloat64":
-        return nullFloat64ToString(*i.(*sql.NullFloat64))
+        return NullFloat64ToString(*i.(*sql.NullFloat64))
     case "*sql.NullString":
-        return nullStringToString(*i.(*sql.NullString))
+        return NullStringToString(*i.(*sql.NullString))
     case "*sql.NullTime":
-        return nullTimeToString(*i.(*sql.NullTime), columnType)
+        return NullTimeToString(*i.(*sql.NullTime), columnType)
     }
     return ""
 }
 
-func defineColumnTypes(rows *sql.Rows) (columnTypes []*sql.ColumnType, row []interface{}, err error) {
+func DefineColumnTypes(rows *sql.Rows) (columnTypes []*sql.ColumnType, row []interface{}, err error) {
     columnTypes, err = rows.ColumnTypes()
     if err != nil {
     	return
@@ -184,9 +192,9 @@ func defineColumnTypes(rows *sql.Rows) (columnTypes []*sql.ColumnType, row []int
     return
 }
 
-func unloadTable(params Params) {
+func UnloadTable(params Params) {
     fmt.Println("... Setting up Database Connection")
-    db, err := connectToDB(params.ConnStr)
+    db, err := ConnectToDB(params.ConnStr)
     if err != nil {
         fmt.Println("... DB Setup Failed")
         fmt.Println(err)
@@ -203,7 +211,7 @@ func unloadTable(params Params) {
     }
 
     // Define column types
-    columnTypes, row, err := defineColumnTypes(rows)
+    columnTypes, row, err := DefineColumnTypes(rows)
     if err != nil {
         fmt.Println("... Error defining column types")
         fmt.Println(err)
@@ -220,19 +228,19 @@ func unloadTable(params Params) {
 
     // Write to file
     go func(params Params, ciRows <- chan []string) {
-        writeToFile(0, params, params.MaxSizeMB, ciRows)
+        WriteToFile(0, params, params.MaxSizeMB, ciRows)
         w.Done()
     }(params, cRows)
 
     // Fetch rows
-    fetchRows(rows, row, columnTypes, params.DoubleQuotes, cRows)
+    FetchRows(rows, row, columnTypes, params.DoubleQuotes, cRows)
 
     rows.Close()
 
     fmt.Println("... Closing connection")
 }
 
-func runUnloadTableByRange(params Params, rangeStart int, rangeEnd int, batchSize int, parallel int) {
+func RunUnloadTableByRange(params Params, rangeStart int, rangeEnd int, batchSize int, parallel int) {
     var w sync.WaitGroup
     w.Add(parallel)
     defer w.Wait()
@@ -247,7 +255,7 @@ func runUnloadTableByRange(params Params, rangeStart int, rangeEnd int, batchSiz
 
     for p := 1; p <= parallel; p++ {
         go func(rId int, params Params, ciRange <- chan Range, coError chan <- error) {
-            unloadTableByRange(rId, params, ciRange, coError)
+            UnloadTableByRange(rId, params, ciRange, coError)
             w.Done()
         }(p, params, cRange, cError)
     }
@@ -277,9 +285,9 @@ func runUnloadTableByRange(params Params, rangeStart int, rangeEnd int, batchSiz
     }
 }
 
-func unloadTableByRange(rId int, params Params, ciRange <- chan Range, coError chan <- error) {
+func UnloadTableByRange(rId int, params Params, ciRange <- chan Range, coError chan <- error) {
     fmt.Println(rId, "... Setting up Database Connection")
-    db, err := connectToDB(params.ConnStr)
+    db, err := ConnectToDB(params.ConnStr)
     if err != nil {
         coError <- err
         return
@@ -299,7 +307,7 @@ func unloadTableByRange(rId int, params Params, ciRange <- chan Range, coError c
 
     // Write to file
     go func(rId int, params Params, ciRows <- chan []string) {
-        writeToFile(rId, params, params.MaxSizeMB, ciRows)
+        WriteToFile(rId, params, params.MaxSizeMB, ciRows)
         w.Done()
     }(rId, params, cRows)
 
@@ -315,14 +323,14 @@ func unloadTableByRange(rId int, params Params, ciRange <- chan Range, coError c
         }
 
         // Define column types
-	    columnTypes, row, err := defineColumnTypes(rows)
+	    columnTypes, row, err := DefineColumnTypes(rows)
 	    if err != nil {
 	    	fmt.Println(rId, "... Error defining column types", err)
 	        return
 	    }
 
         // Fetch rows
-        fetchRows(rows, row, columnTypes, params.DoubleQuotes, cRows)
+        FetchRows(rows, row, columnTypes, params.DoubleQuotes, cRows)
 
         rows.Close()
     }
@@ -330,7 +338,7 @@ func unloadTableByRange(rId int, params Params, ciRange <- chan Range, coError c
     fmt.Println(rId, "... Closing connection")
 }
 
-func connectToDB(connStr string) (db *sql.DB, err error) {
+func ConnectToDB(connStr string) (db *sql.DB, err error) {
     // Connect
     db, err = sql.Open("godror", connStr)
     if err != nil {
@@ -352,7 +360,7 @@ func connectToDB(connStr string) (db *sql.DB, err error) {
     return db, nil
 }
 
-func fetchRows(rows *sql.Rows, row []interface{}, columnTypes []*sql.ColumnType, doubleQuotes bool, coRows chan <- []string) {
+func FetchRows(rows *sql.Rows, row []interface{}, columnTypes []*sql.ColumnType, doubleQuotes bool, coRows chan <- []string) {
     for rows.Next() {
         if err := rows.Scan(row...); err != nil {
             fmt.Println(err)
@@ -363,7 +371,7 @@ func fetchRows(rows *sql.Rows, row []interface{}, columnTypes []*sql.ColumnType,
         // Columns to string array
         for i, col := range row {
             typeName := columnTypes[i].DatabaseTypeName();
-            strRow[i] = toString(col, typeName)
+            strRow[i] = ToString(col, typeName)
 
             if doubleQuotes && (typeName == "VARCHAR2" || typeName == "NVARCHAR2" || typeName == "DATE" || typeName == "TIMESTAMP" || typeName == "TIMESTAMP WITH TIME ZONE" || typeName == "TIMESTAMP WITH LOCAL TIME ZONE") {
                 strRow[i] = "\"" + strings.ReplaceAll(strRow[i], "\"", "\"\"") + "\""
@@ -374,44 +382,96 @@ func fetchRows(rows *sql.Rows, row []interface{}, columnTypes []*sql.ColumnType,
     }
 }
 
-func newFile(fileName string, format string, rId int, counter int) (*os.File, int) {
-    c := counter;
-    c++;
+func TrimExtension(fileName string) string {
+    extension := filepath.Ext(fileName)
+    name := fileName[0:len(fileName)-len(extension)]
+    return name
+}
+
+func NewFile(fileName string, extension string, rId int, counter *int) (*os.File) {
+    *counter++;
 
     fn := fileName;
     if rId == 0 {
-        fn += fmt.Sprintf("_%07d." + format, c);
+        fn += fmt.Sprintf("_%07d." + extension, *counter);
     } else {
-        fn += fmt.Sprintf("_%d_%07d." + format, rId, c)
+        fn += fmt.Sprintf("_%d_%07d." + extension, rId, *counter)
     }
 
     f, err := os.Create(fn)
     if err != nil {
-        fmt.Println("newFile", err)
+        fmt.Println("NewFile", err)
         f.Close()
     }
-    return f, c
+    return f
 }
 
-func getSizeMB(f *os.File) float64 {
+func CompressFile(fileName string) {
+    f, _ := os.Open(fileName)
+
+    gz, err := os.Create(fileName + ".gz")
+    if err != nil {
+        fmt.Println("CompressFile", err)
+        gz.Close()
+    }
+
+    reader := bufio.NewReader(f)
+    content, _ := ioutil.ReadAll(reader)
+
+    w := gzip.NewWriter(gz)
+    w.Write(content)
+    w.Close()
+
+    err = gz.Close()
+    if err != nil {
+        fmt.Println("CompressFile", err)
+    }
+
+    err = f.Close()
+    if err != nil {
+        fmt.Println("CompressFile", err)
+    }
+}
+
+func CloseFile(f *os.File, compress bool) {
+    fileName := f.Name();
+
+    err := f.Close()
+    if err != nil {
+        fmt.Println("CloseFile", err)
+    }
+
+    if !compress {
+        return
+    }
+
+    CompressFile(fileName)
+
+    err = os.Remove(fileName) 
+    if err != nil { 
+        fmt.Println("CloseFile", err)
+    }
+}
+
+func GetSizeMB(f *os.File) float64 {
     fi, err := f.Stat()
     if err != nil {
-        fmt.Println("getSizeMB", err)
+        fmt.Println("GetSizeMB", err)
     }
     return float64(fi.Size()) / 1024 / 1024
 }
 
-func writeToFile(rId int, params Params, maxSizeMB int, ciRows <- chan []string) {
+func WriteToFile(rId int, params Params, maxSizeMB int, ciRows <- chan []string) {
 	counter := 0;
 
 	sep := ",";
-    format := "csv";
+    extension := "csv";
     if params.TabSeparated {
     	sep = "\t"
-    	format = "tsv"
+    	extension = "tsv"
     }
 
-    f, counter := newFile(params.FileName, format, rId, counter)
+    f := NewFile(params.FileName, extension, rId, &counter)
 
     i := 0;
     for row := range ciRows {
@@ -419,21 +479,18 @@ func writeToFile(rId int, params Params, maxSizeMB int, ciRows <- chan []string)
         i++;
         if i >= 1000 {
             i = 0;
-            if float64(maxSizeMB) * float64(0.95) <= getSizeMB(f) {
-                err := f.Close()
-                if err != nil {
-                    fmt.Println("writeToFile", err)
-                }
-                f, counter = newFile(params.FileName, format, rId, counter)
+            compressionRatio := 1.0;
+            if params.Compress {
+                compressionRatio = 0.11;
+            }
+            if float64(maxSizeMB) * float64(0.95) <= GetSizeMB(f) * compressionRatio {
+                CloseFile(f, params.Compress)
+                f = NewFile(params.FileName, extension, rId, &counter)
             }
         }
 
         fmt.Fprintln(f, strings.Join(row, sep))
     }
 
-    // File
-    err := f.Close()
-    if err != nil {
-        fmt.Println("writeToFile", err)
-    }
+    CloseFile(f, params.Compress)
 }
