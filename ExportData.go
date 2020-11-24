@@ -6,6 +6,7 @@ import (
     "database/sql"
     "flag"
     "fmt"
+    "io"
     "io/ioutil"
     "os"
     "path/filepath"
