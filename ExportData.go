@@ -40,7 +40,7 @@ func main() {
     queryFileName := flag.String("query", "", "query file name")
     fileName := flag.String("fname", "-", "file name, without extension")
     maxSizeMB := flag.Int("maxsize", 250, "file max size (MB)")
-    compress := flag.Bool("compress", true, "compress to gzip file")
+    compress := flag.Bool("compress", false, "compress to gzip file")
 
     parallel := flag.Int("parallel", 1, "parallel level")
     rangeStart := flag.String("rangeStart", "-", "range start value")
@@ -149,11 +149,11 @@ func NullTimeToString(v sql.NullTime, columnType string) string {
     case "DATE":
         return v.Time.Format("2006-01-02 15:04:05")
     case "TIMESTAMP":
-        return v.Time.Format("2006-01-02 15:04:05.999999999")
+        return v.Time.Format("2006-01-02 15:04:05.000000000")
     case "TIMESTAMP WITH TIME ZONE":
-        return v.Time.Format("2006-01-02 15:04:05.999999999 -0700")
+        return v.Time.Format("2006-01-02 15:04:05.000000000 -0700")
     case "TIMESTAMP WITH LOCAL TIME ZONE":
-        return v.Time.Format("2006-01-02 15:04:05.999999999")
+        return v.Time.Format("2006-01-02 15:04:05.000000000")
     }
     return ""
 }
@@ -407,29 +407,37 @@ func NewFile(fileName string, extension string, rId int, counter *int) (*os.File
 }
 
 func CompressFile(fileName string) {
-    f, _ := os.Open(fileName)
+    file, err := os.Open(fileName)
+    if err != nil {
+        fmt.Println(err)
+        return
+    }
+    defer file.Close()
 
     gz, err := os.Create(fileName + ".gz")
     if err != nil {
-        fmt.Println("CompressFile", err)
-        gz.Close()
+        fmt.Println(err)
+        return
     }
-
-    reader := bufio.NewReader(f)
-    content, _ := ioutil.ReadAll(reader)
+    defer gz.Close()
 
     w := gzip.NewWriter(gz)
-    w.Write(content)
-    w.Close()
+    defer w.Close()
 
-    err = gz.Close()
-    if err != nil {
-        fmt.Println("CompressFile", err)
-    }
+    reader := bufio.NewReader(file)
+    buf := make([]byte, 1024)
 
-    err = f.Close()
-    if err != nil {
-        fmt.Println("CompressFile", err)
+    for {
+        n, err := reader.Read(buf)
+
+        if err != nil {
+            if err != io.EOF {
+                fmt.Println(err)
+            }
+            break
+        }
+
+        w.Write(buf[0:n])
     }
 }
 
