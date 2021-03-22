@@ -181,7 +181,7 @@ func DefineColumnTypes(rows *sql.Rows) (columnTypes []*sql.ColumnType, row []int
         if c.DatabaseTypeName() == "NUMBER" {
             //row = append(row, &sql.NullFloat64{0, false})
             row = append(row, &sql.NullString{"", false})
-        } else if c.DatabaseTypeName() == "VARCHAR2" || c.DatabaseTypeName() == "NVARCHAR2" {
+        } else if c.DatabaseTypeName() == "VARCHAR2" || c.DatabaseTypeName() == "NVARCHAR2" || c.DatabaseTypeName() == "CLOB" || c.DatabaseTypeName() == "NCLOB" {
             row = append(row, &sql.NullString{"", false})
         } else if c.DatabaseTypeName() == "DATE" || c.DatabaseTypeName() == "TIMESTAMP" || c.DatabaseTypeName() == "TIMESTAMP WITH TIME ZONE" || c.DatabaseTypeName() == "TIMESTAMP WITH LOCAL TIME ZONE" {
             row = append(row, &sql.NullTime {time.Time{}, false})
